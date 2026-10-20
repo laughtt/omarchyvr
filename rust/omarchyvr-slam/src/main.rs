@@ -30,7 +30,7 @@
 //! omarchyvr-slam take-head TAKE [--every N] [--csv OUT]  Record-tracking take: live tracker log + cameras at speed
 //!                       (head speed from the images, features kept, exposure, brightness, blur per speed bin)
 //! omarchyvr-slam take-euroc TAKE [OUT]   take (cameras.pxcam + head-imu.csv) as a EuRoC dataset for run_slam.sh replay
-//! omarchyvr-slam ae         REC.pxcam [--frames N]         auto-exposure dry run on a recording (what it would send)
+//! omarchyvr-slam ae         REC.pxcam [--frames N] [--model crystal-super]  auto-exposure dry run on a recording (what it would send)
 //! omarchyvr-slam shift      DATASET OUT --cam-offset-ns N  copy with camera timestamps shifted (offset sweeps)
 //! omarchyvr-slam camlag     DATASET [--calib XML] [--cam 0] [--every 1] [--range-ms 30] [--radius MIN,MAX]
 //!                       camera-IMU time offset, gyro bias and gyro gain from the recording alone (image rotation
@@ -554,13 +554,17 @@ fn cmd_simulate(mut a: Args) -> R<()> {
 fn cmd_ae(mut a: Args) -> R<()> {
     let src = a.pos("REC.pxcam")?;
     let max: usize = a.num("--frames", 0)?;
+    let model = match a.opt("--model")? {
+        None => pimax_cam::ae::AeModel::DreamAir,
+        Some(m) => pimax_cam::ae::AeModel::parse(&m).ok_or(format!("--model {m}: dream-air or crystal-super"))?,
+    };
     a.done()?;
     use pimax_cam::ae::{AeParams, AeSetting, AutoExposure, Mask, TileView};
     use pimax_cam::camera::Camera;
     use pimax_cam::source::ReplayOptions;
     let mut cam =
         Camera::open(&src, 0, ReplayOptions::default()).map_err(|e| format!("open {src}: {e}"))?;
-    let ae = AutoExposure::new(AeParams::default());
+    let ae = AutoExposure::new(AeParams::for_model(model));
     let mask = Mask::default();
     let (mut n, mut means, mut sats, mut req_e, mut req_g) =
         (0usize, Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -583,7 +587,7 @@ fn cmd_ae(mut a: Args) -> R<()> {
         let st = ae.frame_stats(&tiles, &mask);
         let set = AeSetting::from_info(&info, 40, 62);
         let (e0, g0, _) = ae.step_pair(set.exposure[0], set.gain[0], &st[0]);
-        let (e2, g2, _) = ae.step_pair(set.exposure[2], set.gain[2], &st[1]);
+        let (e2, g2, _) = ae.step_pair_k(1, set.exposure[2], set.gain[2], &st[1]);
         means.push(st[0].trimmed_mean);
         sats.push(st[0].sat_frac);
         req_e.push(e0 as f64);

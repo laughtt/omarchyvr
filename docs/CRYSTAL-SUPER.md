@@ -102,3 +102,18 @@ Pimax driver take the Crystal Super's USB id) with
 broker and `pimax-ctrltrack live --factory` with `PIMAX_CAM_CALIB` = the headset's factory calibration
 (`slam/device_calibration_<serial>.xml` from a Pimax Play install). 3DoF, the picture and the Pimax controllers work;
 6DoF of the head does not yet.
+
+### Camera auto exposure (experimental, off by default)
+
+The tracking cameras start at the Crystal's firmware default (3500 us, gain 60). Pimax Play on Windows pushes exposure
+and gain every 80 ms with the same HID frame as on the Dream Air, but with the Crystal's own, much brighter ranges:
+lower pair 2200..10410 us / gain 13..449, upper pair 2200..8941 us / gain 13..439 (`analysis/crystal-super-ae.md`).
+The Linux controller (`pimax-cam`, the same law as the Dream Air) uses exactly those values for the Crystal, and the
+headset's allowlist (`devices/crystal-super/device.toml`, `camera_ae`) refuses anything outside them.
+
+- Turn it on: `PIMAX_CAM_AE=1` in the Monado / SteamVR driver environment (in the 6DoF setup the `SETTINGS` of
+  `crystal-6dof.sh`; for a recording `rec_env=PIMAX_CAM_AE=1`). `PIMAX_CAM_AE=dry` only computes and logs.
+- The model is taken from the USB id (34a4:0040); `PIMAX_CAM_AE_MODEL=crystal-super` forces it. The Monado log shows
+  `PIMAX_AE_MODEL: crystal-super (USB 34a4:0040); Windows ranges enforced: ...` once at start.
+- Expect one short camera gap at the first push (the cameras restart; probably 60 -> 50 fps as on the Dream Air).
+- Needs a Monado relinked against this pimax-cam (the `PIMAX_AE_MODEL` marker is then in `monado-service`).

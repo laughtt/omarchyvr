@@ -5,17 +5,18 @@
 //! (`PIMAX_CAM_AE=1`; `dry` = compute and log only). Nothing here touches the device.
 
 use crate::ae::{
-    payload, AeParams, AeSetting, AutoExposure, LightEvent, Mask, TileView, AE_PAYLOAD_LEN,
+    payload, AeModel, AeParams, AeSetting, AutoExposure, LightEvent, Mask, TileView, AE_PAYLOAD_LEN,
 };
 use crate::camera::{FLAG_META_VALID, FLAG_REPLAY};
 use crate::capi::{guard, PimaxCam};
 use crate::frame::FrameKind;
-use std::ffi::c_int;
+use std::ffi::{c_char, c_int, CStr};
 
 /// Opaque controller handle.
 pub struct CAe {
     ae: AutoExposure,
     mask: Mask,
+    refused: u64,
 }
 
 /// `pimax_cam_ae_out`.
@@ -59,17 +60,49 @@ pub struct CAeOut {
     pub light: u32,
 }
 
-/// Create a controller with the defaults and the `PIMAX_CAM_AE_*` environment overrides.
+fn create(model: AeModel, why: &str) -> *mut CAe {
+    let ae = AutoExposure::new(AeParams::from_env_model(model));
+    // Once-at-start markers (also in the binary: the build check greps for them).
+    eprintln!("{}", model_line(&ae, why));
+    eprintln!("{}", start_line(&ae));
+    Box::into_raw(Box::new(CAe {
+        ae,
+        mask: Mask::default(),
+        refused: 0,
+    }))
+}
+
+/// Create a controller with the defaults of the headset on USB (`PIMAX_CAM_AE_MODEL` overrides; Dream Air when
+/// none is found) and the `PIMAX_CAM_AE_*` environment overrides.
 #[no_mangle]
 pub extern "C" fn pimax_cam_ae_create() -> *mut CAe {
     guard(std::ptr::null_mut(), || {
-        let ae = AutoExposure::new(AeParams::from_env());
-        // Once-at-start marker (also in the binary: the build check greps for it).
-        eprintln!("{}", start_line(&ae));
-        Ok(Box::into_raw(Box::new(CAe {
-            ae,
-            mask: Mask::default(),
-        })))
+        let (m, why) = AeModel::detect();
+        Ok(create(m, &why))
+    })
+}
+
+/// [`pimax_cam_ae_create`] for a named headset model (`"dream-air"`, `"crystal-super"`; NULL or "" = detect).
+/// `PIMAX_CAM_AE_MODEL` still overrides. NULL (and `pimax_cam_last_error`) for an unknown name.
+///
+/// # Safety
+/// `model` NULL or a NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn pimax_cam_ae_create_model(model: *const c_char) -> *mut CAe {
+    guard(std::ptr::null_mut(), || {
+        let name = if model.is_null() {
+            String::new()
+        } else {
+            // SAFETY: per contract.
+            unsafe { CStr::from_ptr(model) }.to_string_lossy().into_owned()
+        };
+        let env = std::env::var("PIMAX_CAM_AE_MODEL").ok().and_then(|v| AeModel::parse(&v));
+        if name.trim().is_empty() || env.is_some() {
+            let (m, why) = AeModel::detect();
+            return Ok(create(m, &why));
+        }
+        let m = AeModel::parse(&name).ok_or_else(|| format!("unknown headset model {name:?} (dream-air or crystal-super)"))?;
+        Ok(create(m, "the driver"))
     })
 }
 
@@ -125,8 +158,23 @@ pub unsafe extern "C" fn pimax_cam_ae_update(
             report(ev, &a.ae);
         }
         let tgt = a.ae.target().unwrap_or(setting);
+        // Last guard: a model with Windows ranges (Crystal Super) never hands out a setting outside them.
+        let allowed = a.ae.p.model.allows(&tgt);
+        if !allowed {
+            a.refused += 1;
+            if a.refused == 1 || a.refused % 1000 == 0 {
+                eprintln!(
+                    "PIMAX_AE_MODEL: {} setting {:?}/{:?} outside the Windows ranges, not sent ({} so far)",
+                    a.ae.p.model.id(),
+                    tgt.exposure,
+                    tgt.gain,
+                    a.refused
+                );
+            }
+        }
+        let send = d.send && allowed;
         let o = CAeOut {
-            send: d.send as u32,
+            send: send as u32,
             changed: d.changed as u32,
             frames: a.ae.frames,
             sends: a.ae.sends,
@@ -151,13 +199,26 @@ pub unsafe extern "C" fn pimax_cam_ae_update(
         crate::headpose::scene::publish(o.mean[0].min(o.mean[1]) as f64);
         // SAFETY: writable per contract.
         unsafe { *out = o };
-        Ok(d.send as c_int)
+        Ok(send as c_int)
     })
 }
 
 /// The headset text of the low-light warning (also shown on the app's status page).
 pub const LOW_LIGHT_TEXT: &str =
     "Tracking cameras see too little infrared light \u{2014} daylight or an IR lamp helps";
+
+/// Start-up marker line of the headset model (`PIMAX_AE_MODEL`): which constants run and where the model came from.
+pub fn model_line(ae: &AutoExposure, why: &str) -> String {
+    let p = &ae.p;
+    let ranges = match p.model.pair_ranges() {
+        Some(r) => format!(
+            "Windows ranges enforced: lower pair {}..{} us / gain {}..{}, upper pair {}..{} us / gain {}..{}",
+            r[0].0, r[0].1, r[0].2, r[0].3, r[1].0, r[1].1, r[1].2, r[1].3
+        ),
+        None => format!("exposure {}..{} us, gain {}..{}", p.exposure_min, p.exposure_max, p.gain_min, p.gain_max),
+    };
+    format!("PIMAX_AE_MODEL: {} ({why}); {ranges}", p.model.id())
+}
 
 /// Start-up marker line (`PIMAX_AE_EXTENDED`).
 pub fn start_line(ae: &AutoExposure) -> String {
@@ -228,6 +289,33 @@ mod tests {
         );
         // SAFETY: created above.
         unsafe { pimax_cam_ae_destroy(a) };
+    }
+
+    #[test]
+    fn create_for_a_named_model() {
+        for name in [c"crystal-super", c"dream-air", c""] {
+            // SAFETY: NUL-terminated literal.
+            let a = unsafe { pimax_cam_ae_create_model(name.as_ptr()) };
+            assert!(!a.is_null(), "{name:?}");
+            // SAFETY: created above.
+            unsafe { pimax_cam_ae_destroy(a) };
+        }
+        // SAFETY: NULL is allowed (detect).
+        let a = unsafe { pimax_cam_ae_create_model(std::ptr::null()) };
+        assert!(!a.is_null());
+        // SAFETY: created above.
+        unsafe { pimax_cam_ae_destroy(a) };
+        if std::env::var("PIMAX_CAM_AE_MODEL").is_err() {
+            // SAFETY: NUL-terminated literal.
+            assert!(unsafe { pimax_cam_ae_create_model(c"8kx".as_ptr()) }.is_null());
+        }
+        let c = AutoExposure::new(AeParams::for_model(AeModel::CrystalSuper));
+        let l = model_line(&c, "USB 34a4:0040");
+        assert!(l.starts_with("PIMAX_AE_MODEL: crystal-super (USB 34a4:0040)"), "{l}");
+        assert!(l.contains("upper pair 2200..8941 us / gain 13..439"), "{l}");
+        assert!(start_line(&c).starts_with("PIMAX_AE_EXTENDED: off"));
+        let d = AutoExposure::new(AeParams::default());
+        assert_eq!(model_line(&d, "x"), "PIMAX_AE_MODEL: dream-air (x); exposure 1140..4108 us, gain 13..215");
     }
 
     #[test]

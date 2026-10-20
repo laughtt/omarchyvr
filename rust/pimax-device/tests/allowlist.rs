@@ -244,11 +244,97 @@ fn crystal_super_allows_only_its_captured_commands() {
         g.send(&r).unwrap();
         assert_eq!(g.into_inner().len(), 65, "{id}"); // report id 0 + the 64-byte report
     }
-    // captured but not enabled yet: IPD motor, eye-module power off, camera exposure, pairing
+    // captured but not enabled yet: IPD motor, eye-module power off, pairing (camera exposure: its own test below)
     assert!(m.ipd_report(63.0).is_err());
     assert!(m.pair_report(Hand::Left).is_err());
-    for r in [&[0x58, 0x06, 0x5c, 0x05, 0x01, 0xaf, 0x18][..], &[0x58, 0x05, 0x3c, 0x05, 0x00, 0x00], &[0x58, 0x19, 0x51, 0x00, 0x01, 0x32]] {
+    for r in [&[0x58, 0x06, 0x5c, 0x05, 0x01, 0xaf, 0x18][..], &[0x58, 0x05, 0x3c, 0x05, 0x00, 0x00]] {
         assert!(matches!(refused(m, &pad(r)), Refused::NotListed), "{r:02x?}");
     }
     assert!(matches!(refused(m, &pad(&[0x58, 0x04, 0x39, 0x00, 0x3c, 0x00])), Refused::OutOfRange { .. }));
+}
+
+fn ae_vals(s: &pimax_cam::ae::AeSetting) -> Vec<(&'static str, u32)> {
+    let n = ["e0", "e1", "e2", "e3", "g0", "g1", "g2", "g3", "led_e", "led_g"];
+    let v = [s.exposure[0], s.exposure[1], s.exposure[2], s.exposure[3], s.gain[0], s.gain[1], s.gain[2], s.gain[3], s.led_exposure, s.led_gain];
+    n.iter().copied().zip(v.iter().map(|&x| u32::from(x))).collect()
+}
+
+/// The Crystal Super's camera exposure push: Windows' per-pair ranges of the 2026-10-17 capture pass, anything outside
+/// them does not; the Dream Air's ranges are unchanged (the two descriptors are checked separately).
+#[test]
+fn crystal_super_camera_ae_uses_its_own_windows_ranges() {
+    use pimax_cam::ae::{payload, AeModel, AeParams, AeSetting, AutoExposure, TileStats, CRYSTAL_HIGH, CRYSTAL_PAIR_RANGES};
+    let m = by_id("crystal-super").unwrap();
+    let al = &m.descriptor().allowlist;
+    // The first command of take cold2 (2200/13) and the brightest Windows sent (lower 10410/449, upper 8941/439).
+    let first = pad(&[
+        0x58, 0x19, 0x51, 0x00, 0x01, 0x32, 0x98, 0x08, 0x98, 0x08, 0x98, 0x08, 0x98, 0x08, 0x0d, 0x00, 0x0d, 0x00, 0x0d, 0x00, 0x0d,
+        0x00, 0x28, 0x00, 0x3e, 0x00,
+    ]);
+    assert_eq!(al.check(0, &first).map(|c| c.id.as_str()), Ok("camera_ae"));
+    let top = AeSetting { exposure: [10410, 10410, 8941, 8941], gain: [449, 449, 439, 439], led_exposure: 40, led_gain: 62 };
+    let r = al.build("camera_ae", &ae_vals(&top)).unwrap();
+    assert_eq!(&r[4..26], &payload(&top)[..]);
+    let mut g = Gate::new(al, 0, Vec::<u8>::new());
+    assert_eq!(g.send(&r).unwrap(), "camera_ae");
+    // Outside: the upper pair at the lower pair's top, below 2200, gain 450, another LED pair, an unknown head.
+    for bad in [
+        AeSetting { exposure: [10410; 4], ..top },
+        AeSetting { gain: [449, 449, 440, 440], ..top },
+        AeSetting { exposure: [2199, 2199, 3000, 3000], ..top },
+        AeSetting { gain: [450, 450, 13, 13], ..top },
+        AeSetting { led_exposure: 25, ..top },
+        AeSetting { led_gain: 35, ..top },
+    ] {
+        let mut b = vec![0x58, 0x19, 0x51, 0x00];
+        b.extend_from_slice(&payload(&bad));
+        assert!(matches!(refused(m, &pad(&b)), Refused::OutOfRange { .. }), "{bad:?}");
+        assert!(!AeModel::CrystalSuper.allows(&bad), "{bad:?}");
+    }
+    let mut b = first.clone();
+    b[5] = 0x3c; // 01 3c instead of 01 32
+    assert!(matches!(refused(m, &b), Refused::NotListed));
+    // The descriptor and pimax-cam agree on the ranges.
+    let p = |id: &str, name: &str| {
+        let c = al.commands.iter().find(|c| c.id == id).unwrap();
+        match &c.params.iter().find(|(n, _)| n == name).unwrap().1 {
+            pimax_device::hid::Constraint::Range(lo, hi) => (*lo, *hi),
+            pimax_device::hid::Constraint::Set(s) => (s[0], *s.last().unwrap()),
+        }
+    };
+    for (k, (e, gname)) in [("e0", "g0"), ("e2", "g2")].iter().enumerate() {
+        let (elo, ehi, glo, ghi) = CRYSTAL_PAIR_RANGES[k];
+        assert_eq!(p("camera_ae", e), (u32::from(elo), u32::from(ehi)));
+        assert_eq!(p("camera_ae", gname), (u32::from(glo), u32::from(ghi)));
+    }
+    // Every setting of the Crystal's high table, in both pairs where the range allows it, builds and passes.
+    for &(e, gn) in &CRYSTAL_HIGH {
+        let (ue, ug) = if e <= 8941 && gn <= 439 { (e, gn) } else { (8941, 439) };
+        let s = AeSetting { exposure: [e, e, ue, ue], gain: [gn, gn, ug, ug], ..top };
+        al.build("camera_ae", &ae_vals(&s)).unwrap();
+    }
+    // The controller itself: from the firmware default through dark and bright frames, every payload it hands out
+    // passes the Crystal's allowlist.
+    let mut ae = AutoExposure::new(AeParams::for_model(AeModel::CrystalSuper));
+    let mut s = AeSetting { exposure: [3500; 4], gain: [60; 4], led_exposure: 40, led_gain: 62 };
+    let mut t = 0u64;
+    for (mean, frames) in [(2.0, 200), (250.0, 200), (64.0, 50), (10.0, 300), (40.0, 100), (200.0, 1000)] {
+        for _ in 0..frames {
+            let st = TileStats { mean, trimmed_mean: mean, p50: mean, p95: mean, sat_frac: if mean > 240.0 { 0.6 } else { 0.0 }, dark_frac: if mean < 8.0 { 0.9 } else { 0.0 }, n: 1000 };
+            let d = ae.update(&s, [st, st], t);
+            let tg = ae.target().unwrap();
+            let mut b = vec![0x58, 0x19, 0x51, 0x00];
+            b.extend_from_slice(&payload(&tg));
+            assert_eq!(al.check(0, &pad(&b)).map(|c| c.id.as_str()), Ok("camera_ae"), "{tg:?}");
+            if d.send {
+                s = tg;
+            }
+            t += 40_000_000;
+        }
+    }
+    assert_eq!((s.exposure[0], s.gain[0]), (2200, 13), "bright room ends at Windows' lowest setting");
+    // The Dream Air keeps its own (unchanged) ranges: the Crystal's high settings are refused there.
+    let da = DreamAir(dream_air().descriptor().clone());
+    assert!(da.ae_report(&Ae { exposure: [5641; 4], gain: [215; 4], led_exposure: 40, led_gain: 62 }).is_err());
+    assert!(da.ae_report(&Ae { exposure: [2200; 4], gain: [13; 4], led_exposure: 40, led_gain: 62 }).is_ok());
 }

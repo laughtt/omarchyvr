@@ -57,16 +57,26 @@ pub const EXPOSURE_LADDER: [u16; 44] = [
 
 /// Nearest ladder value (geometric extension outside the table).
 pub fn ladder(e: f64) -> f64 {
-    let (lo, hi) = (
-        EXPOSURE_LADDER[0] as f64,
-        EXPOSURE_LADDER[EXPOSURE_LADDER.len() - 1] as f64,
-    );
+    ladder_in(&EXPOSURE_LADDER, e)
+}
+
+/// Largest ladder value <= `e` (geometric extension below the table).
+pub fn ladder_down(e: f64) -> f64 {
+    ladder_down_in(&EXPOSURE_LADDER, e)
+}
+
+/// Linux power-on default of the tracking gain (no AE).
+pub const POWER_ON_GAIN: u16 = 449;
+
+/// Nearest value of an ascending `table` (geometric extension with Windows' ratio outside it).
+pub fn ladder_in(table: &[u16], e: f64) -> f64 {
+    let (lo, hi) = (table[0] as f64, table[table.len() - 1] as f64);
     if e < lo || e > hi {
         let k = ((e.max(1.0) / LADDER_ANCHOR).ln() / LADDER_RATIO.ln()).round();
         return (LADDER_ANCHOR * LADDER_RATIO.powf(k)).round();
     }
     let mut best = lo;
-    for &v in &EXPOSURE_LADDER {
+    for &v in table {
         if (v as f64 - e).abs() < (best - e).abs() {
             best = v as f64;
         }
@@ -74,9 +84,9 @@ pub fn ladder(e: f64) -> f64 {
     best
 }
 
-/// Largest ladder value <= `e` (geometric extension below the table).
-pub fn ladder_down(e: f64) -> f64 {
-    match EXPOSURE_LADDER.iter().rev().find(|&&v| v as f64 <= e) {
+/// Largest value of an ascending `table` <= `e` (geometric extension below it).
+pub fn ladder_down_in(table: &[u16], e: f64) -> f64 {
+    match table.iter().rev().find(|&&v| v as f64 <= e) {
         Some(&v) => v as f64,
         None => {
             let k = ((e.max(1.0) / LADDER_ANCHOR).ln() / LADDER_RATIO.ln() + 1e-9).floor();
@@ -85,8 +95,179 @@ pub fn ladder_down(e: f64) -> f64 {
     }
 }
 
-/// Linux power-on default of the tracking gain (no AE).
-pub const POWER_ON_GAIN: u16 = 449;
+// ---- Crystal Super: what Pimax Play sent on Windows (capture 2026-10-17, 16751 commands in 14 takes;
+// `analysis/crystal-super-ae.md`). Same frame, same 80 ms period, same pairs (0,1 / 2,3 always equal), same LED pair.
+
+/// Crystal Super exposure ladder at the low gains: Windows' Dream Air ladder from the Crystal's lowest value (2200,
+/// also its first command after a camera start) up to the soft cap 4108. Values seen at gain 13: 2200, 2875, 2962,
+/// 3758, 3988, all on this ladder.
+pub const CRYSTAL_EXPOSURE_LADDER: [u16; 22] = [
+    2200, 2266, 2334, 2405, 2478, 2553, 2630, 2709, 2791, 2875, 2962, 3051, 3143, 3238, 3336, 3437, 3541,
+    3648, 3758, 3871, 3988, 4108,
+];
+
+/// Crystal Super gain codes below the top gain (215), as Windows sent them on the Crystal.
+pub const CRYSTAL_GAIN_CODES: [u16; 28] = [
+    13, 17, 19, 21, 23, 29, 32, 35, 43, 46, 49, 53, 58, 65, 71, 78, 79, 87, 95, 105, 116, 128, 141, 155,
+    171, 188, 207, 215,
+];
+
+/// Crystal Super settings above the soft exposure cap, ascending exposure x gain: Windows first raises the exposure
+/// at gain 215 (3 % ladder, 4194..5641 us), then exposure and gain together, one fixed gain per exposure, up to the
+/// power-on-like 10410 / 449. Every pair was sent by Windows; the Crystal used this range all session (median
+/// lower pair 6739 / 288).
+pub const CRYSTAL_HIGH: [(u16, u16); 41] = [
+    (4194, 215), (4320, 215), (4450, 215), (4584, 215), (4722, 215), (4864, 215), (5051, 215), (5161, 215),
+    (5316, 215), (5476, 215), (5641, 215), (5720, 220), (5811, 226), (5986, 237), (6072, 244), (6166, 249),
+    (6351, 261), (6440, 270), (6542, 275), (6632, 280), (6739, 288), (6942, 303), (7042, 309), (7151, 318),
+    (7251, 326), (7366, 334), (7462, 334), (7587, 351), (7662, 358), (7815, 368), (7880, 370), (7980, 375),
+    (8050, 387), (8292, 406), (8342, 421), (8541, 426), (8741, 431), (8941, 439), (9541, 439), (9841, 446),
+    (10410, 449),
+];
+
+/// Crystal Super firmware default of the tracking cameras before the first push (frame metadata, 2026-10-18).
+pub const CRYSTAL_POWER_ON: (u16, u16) = (3500, 60);
+
+/// Windows' range of one camera pair: (exposure min, exposure max, gain min, gain max).
+pub type PairRange = (u16, u16, u16, u16);
+
+/// Crystal Super ranges per pair, exactly what Windows sent: lower pair (cameras 0, 1) 2200..10410 us, gain 13..449;
+/// upper pair (2, 3) 2200..8941 us, gain 13..439. The same ranges are the allowlist of `camera_ae` in
+/// `pimax-device/devices/crystal-super/device.toml`.
+pub const CRYSTAL_PAIR_RANGES: [PairRange; 2] = [(2200, 10410, 13, 449), (2200, 8941, 13, 439)];
+
+/// The headset whose Windows auto-exposure the controller follows. Only the model constants differ (ladder, gain
+/// codes, limits, power-on default); the control law is the same.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AeModel {
+    /// Pimax Dream Air (34a4:0044): `analysis/slam-exposure.md`. The default, unchanged.
+    #[default]
+    DreamAir,
+    /// Pimax Crystal Super (34a4:0040): `analysis/crystal-super-ae.md`.
+    CrystalSuper,
+}
+
+impl AeModel {
+    /// Device module id (`pimax-device/devices/<id>`).
+    pub fn id(self) -> &'static str {
+        match self {
+            AeModel::DreamAir => "dream-air",
+            AeModel::CrystalSuper => "crystal-super",
+        }
+    }
+
+    /// From a module id (`dream-air`, `crystal-super`; a few spellings).
+    pub fn parse(s: &str) -> Option<AeModel> {
+        match s.trim().to_ascii_lowercase().replace(['_', ' '], "-").as_str() {
+            "dream-air" | "dreamair" | "0044" | "0x0044" => Some(AeModel::DreamAir),
+            "crystal-super" | "crystalsuper" | "crystal" | "0040" | "0x0040" => Some(AeModel::CrystalSuper),
+            _ => None,
+        }
+    }
+
+    /// From the product id of the headset's HID chip.
+    pub fn by_pid(pid: u16) -> Option<AeModel> {
+        match pid {
+            0x0044 => Some(AeModel::DreamAir),
+            0x0040 => Some(AeModel::CrystalSuper),
+            _ => None,
+        }
+    }
+
+    /// Exposure ladder at the low gains.
+    pub fn ladder(self) -> &'static [u16] {
+        match self {
+            AeModel::DreamAir => &EXPOSURE_LADDER,
+            AeModel::CrystalSuper => &CRYSTAL_EXPOSURE_LADDER,
+        }
+    }
+
+    /// Gain codes used with the soft exposure cap.
+    pub fn gain_codes(self) -> &'static [u16] {
+        match self {
+            AeModel::DreamAir => &GAIN_CODES,
+            AeModel::CrystalSuper => &CRYSTAL_GAIN_CODES,
+        }
+    }
+
+    /// (exposure, gain) settings above the soft cap at the top gain code (empty: the Dream Air's split).
+    pub fn high(self) -> &'static [(u16, u16)] {
+        match self {
+            AeModel::DreamAir => &[],
+            AeModel::CrystalSuper => &CRYSTAL_HIGH,
+        }
+    }
+
+    /// The cameras' setting before the first push.
+    pub fn power_on(self) -> (u16, u16) {
+        match self {
+            AeModel::DreamAir => (POWER_ON_EXPOSURE, POWER_ON_GAIN),
+            AeModel::CrystalSuper => CRYSTAL_POWER_ON,
+        }
+    }
+
+    /// Windows' range of each pair, enforced on every setting (None: not enforced, the Dream Air as before).
+    pub fn pair_ranges(self) -> Option<[PairRange; 2]> {
+        match self {
+            AeModel::DreamAir => None,
+            AeModel::CrystalSuper => Some(CRYSTAL_PAIR_RANGES),
+        }
+    }
+
+    /// The setting is inside Windows' ranges of this model (always true without enforced ranges).
+    pub fn allows(self, s: &AeSetting) -> bool {
+        let Some(r) = self.pair_ranges() else { return true };
+        let ok = |c: usize, (elo, ehi, glo, ghi): PairRange| {
+            (elo..=ehi).contains(&s.exposure[c]) && (glo..=ghi).contains(&s.gain[c])
+        };
+        ok(0, r[0]) && ok(1, r[0]) && ok(2, r[1]) && ok(3, r[1]) && s.led_exposure == 40 && s.led_gain == 62
+    }
+
+    /// The model of the headset on USB (`PIMAX_CAM_AE_MODEL` first, then the HID chip in sysfs; Dream Air when none
+    /// or both are found) and where that came from.
+    pub fn detect() -> (AeModel, String) {
+        if let Ok(v) = std::env::var("PIMAX_CAM_AE_MODEL") {
+            if let Some(m) = AeModel::parse(&v) {
+                return (m, "PIMAX_CAM_AE_MODEL".into());
+            }
+            if !v.trim().is_empty() {
+                eprintln!("PIMAX_CAM_AE_MODEL={v} unknown (dream-air or crystal-super); looking at USB");
+            }
+        }
+        let pids = usb_pids_sysfs(std::path::Path::new("/sys/bus/usb/devices"));
+        let (m, why) = model_from_pids(&pids);
+        (m, why.into())
+    }
+}
+
+/// Product ids of the vendor 34a4 devices in a sysfs USB directory.
+pub fn usb_pids_sysfs(dir: &std::path::Path) -> Vec<u16> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else { return out };
+    for e in rd.flatten() {
+        let p = e.path();
+        let rd = |n: &str| std::fs::read_to_string(p.join(n)).ok().map(|s| s.trim().to_ascii_lowercase());
+        if rd("idVendor").as_deref() == Some("34a4") {
+            if let Some(pid) = rd("idProduct").and_then(|s| u16::from_str_radix(&s, 16).ok()) {
+                out.push(pid);
+            }
+        }
+    }
+    out
+}
+
+/// The model from the Pimax product ids on USB: the Crystal Super only when its HID chip (0040) is there and the
+/// Dream Air's (0044) is not; everything else keeps the Dream Air.
+pub fn model_from_pids(pids: &[u16]) -> (AeModel, &'static str) {
+    let crystal = pids.contains(&0x0040);
+    let dream = pids.contains(&0x0044);
+    match (crystal, dream) {
+        (true, false) => (AeModel::CrystalSuper, "USB 34a4:0040"),
+        (false, true) => (AeModel::DreamAir, "USB 34a4:0044"),
+        (true, true) => (AeModel::DreamAir, "both headsets on USB, Dream Air kept"),
+        (false, false) => (AeModel::DreamAir, "no headset on USB, Dream Air default"),
+    }
+}
 
 /// Exposure and gain of the four cameras plus the LED-frame pair (raw units, as on the wire).
 #[repr(C)]
@@ -535,6 +716,8 @@ pub struct AeParams {
     pub min_change_ns: u64,
     /// The "too bright" rule releases (and brightening is allowed again) only below this clipped fraction.
     pub sat_release: f64,
+    /// Headset model: ladder, gain codes, the settings above the soft cap and Windows' per-pair ranges.
+    pub model: AeModel,
 }
 
 /// Which control law runs. `PIMAX_CAM_AE_LAW=old` (also `v1`) selects [`AeLaw::V1`], the kill switch.
@@ -584,6 +767,55 @@ impl Default for AeParams {
             law: AeLaw::V2,
             min_change_ns: 200_000_000,
             sat_release: 0.12,
+            model: AeModel::DreamAir,
+        }
+    }
+}
+
+impl AeParams {
+    /// The defaults for a headset model. Dream Air: [`AeParams::default`], unchanged. Crystal Super: Windows'
+    /// Crystal ranges (2200..10410 us, gain 13..449; upper pair up to 8941 / 439), the soft cap 4108 (gain before
+    /// exposure above it, as Windows), no automatic extended range (the normal range already reaches 10410 / 449)
+    /// and no clip-driven low stage (Windows never went below 2200 on the Crystal).
+    pub fn for_model(model: AeModel) -> AeParams {
+        match model {
+            AeModel::DreamAir => AeParams::default(),
+            AeModel::CrystalSuper => {
+                let [lo, _] = CRYSTAL_PAIR_RANGES;
+                AeParams {
+                    exposure_min: lo.0,
+                    exposure_max: lo.1,
+                    gain_min: lo.2,
+                    gain_max: lo.3,
+                    exposure_soft: 4108,
+                    light: LightParams {
+                        ext_exposure: lo.1,
+                        ext_gain: lo.3,
+                        clip_enabled: false,
+                        ..LightParams::default()
+                    },
+                    model,
+                    ..AeParams::default()
+                }
+            }
+        }
+    }
+
+    /// [`AeParams::old_law`] for a model (the Crystal keeps its Windows floor).
+    pub fn old_law_for(model: AeModel) -> AeParams {
+        match model {
+            AeModel::DreamAir => AeParams::old_law(),
+            AeModel::CrystalSuper => {
+                let o = AeParams::old_law();
+                AeParams {
+                    deadband: o.deadband,
+                    sat_max_frac: o.sat_max_frac,
+                    law: o.law,
+                    min_change_ns: o.min_change_ns,
+                    sat_release: o.sat_release,
+                    ..AeParams::for_model(model)
+                }
+            }
         }
     }
 }
@@ -613,23 +845,34 @@ impl AeParams {
     /// Defaults with `PIMAX_CAM_AE_TARGET`, `_EXP_MAX`, `_EXP_MIN`, `_GAIN_MAX`, `_GAIN_MIN`, `_PERIOD_MS`,
     /// `_K`, `_DEADBAND`, `_UPPER` (0/1) overrides, and `PIMAX_CAM_AE_LAW=old` (kill switch: the previous law). Values are clamped to sane ranges.
     pub fn from_env() -> AeParams {
+        AeParams::from_env_model(AeModel::DreamAir)
+    }
+
+    /// [`AeParams::from_env`] for a headset model. For the Crystal Super the exposure and gain overrides stay inside
+    /// Windows' Crystal range (2200..10410 us, gain 13..449); the Dream Air's bounds are unchanged.
+    pub fn from_env_model(model: AeModel) -> AeParams {
         let old = std::env::var("PIMAX_CAM_AE_LAW")
             .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "old" | "v1" | "off" | "0"));
-        let mut p = if old { AeParams::old_law() } else { AeParams::default() };
+        let mut p = if old { AeParams::old_law_for(model) } else { AeParams::for_model(model) };
+        // (exposure-cap floor, exposure-floor floor, gain floor, ceilings) for the overrides.
+        let (emax_lo, emin_lo, g_lo, e_hi, g_hi) = match model.pair_ranges() {
+            None => (100.0, 1.0, 1.0, 10410.0, 449.0),
+            Some([r, _]) => (r.0 as f64, r.0 as f64, r.2 as f64, r.1 as f64, r.3 as f64),
+        };
         if let Some(v) = env_f64("PIMAX_CAM_AE_TARGET") {
             p.target = v.clamp(20.0, 200.0);
         }
         if let Some(v) = env_f64("PIMAX_CAM_AE_EXP_MAX") {
-            p.exposure_max = v.clamp(100.0, 10410.0) as u16;
+            p.exposure_max = v.clamp(emax_lo, e_hi) as u16;
         }
         if let Some(v) = env_f64("PIMAX_CAM_AE_EXP_MIN") {
-            p.exposure_min = v.clamp(1.0, p.exposure_max as f64) as u16;
+            p.exposure_min = v.clamp(emin_lo, p.exposure_max as f64) as u16;
         }
         if let Some(v) = env_f64("PIMAX_CAM_AE_GAIN_MAX") {
-            p.gain_max = v.clamp(1.0, 449.0) as u16;
+            p.gain_max = v.clamp(g_lo, g_hi) as u16;
         }
         if let Some(v) = env_f64("PIMAX_CAM_AE_GAIN_MIN") {
-            p.gain_min = v.clamp(1.0, p.gain_max as f64) as u16;
+            p.gain_min = v.clamp(g_lo, p.gain_max as f64) as u16;
         }
         if let Some(v) = env_f64("PIMAX_CAM_AE_PERIOD_MS") {
             p.period_ns = (v.clamp(40.0, 2000.0) * 1e6) as u64;
@@ -657,51 +900,97 @@ impl AeParams {
         p
     }
 
-    fn clamp_setting(&self, e: f64, g: f64) -> (u16, u16) {
-        (
-            e.round()
-                .clamp(self.exposure_min as f64, self.exposure_max as f64) as u16,
-            g.round().clamp(self.gain_min as f64, self.gain_max as f64) as u16,
-        )
+    /// Exposure and gain caps of pair `k` (0 lower, 1 upper): the current caps, tightened to the model's Windows
+    /// range of that pair.
+    pub fn pair_caps(&self, k: usize) -> (u16, u16, u16, u16) {
+        let (mut elo, mut ehi, mut glo, mut ghi) = (self.exposure_min, self.exposure_max, self.gain_min, self.gain_max);
+        if let Some(r) = self.model.pair_ranges() {
+            let (a, b, c, d) = r[k.min(1)];
+            elo = elo.clamp(a, b);
+            ehi = ehi.clamp(elo, b);
+            glo = glo.clamp(c, d);
+            ghi = ghi.clamp(glo, d);
+        }
+        (elo, ehi.max(elo), glo, ghi.max(glo))
     }
 
     /// Split a brightness product `e * g` into (exposure, gain): exposure first up to the cap, then gain (as
     /// Windows does). Gain is taken as linear in its raw code (Windows lowers e by ~7 % when g steps 13 -> 15,
     /// consistent with that). With `quantize`, values snap to Windows' ladder / gain codes; above the exposure
     /// cap the smallest gain code that reaches the product is used and the exposure fine-tunes below the cap.
+    /// (The lower pair's caps; [`AeParams::split_pair`] for the upper pair.)
     pub fn split(&self, product: f64) -> (u16, u16) {
-        let g_min = self.gain_min.max(1) as f64;
-        let (e_lo, e_hi) = (self.exposure_min as f64, self.exposure_max as f64);
+        self.split_pair(0, product)
+    }
+
+    /// [`AeParams::split`] within the caps of pair `k` ([`AeParams::pair_caps`]). Above the top gain code at the soft
+    /// cap, a model with a table of higher settings ([`AeModel::high`], the Crystal Super) takes the nearest one;
+    /// the Dream Air grows the exposure (and uses the power-on gain 449 when the cap allows it).
+    pub fn split_pair(&self, k: usize, product: f64) -> (u16, u16) {
+        let (elo, ehi, glo, ghi) = self.pair_caps(k);
+        let clamp = |e: f64, g: f64| -> (u16, u16) {
+            (
+                e.round().clamp(elo as f64, ehi as f64) as u16,
+                g.round().clamp(glo as f64, ghi as f64) as u16,
+            )
+        };
+        let g_min = glo.max(1) as f64;
+        let (e_lo, e_hi) = (elo as f64, ehi as f64);
         let e_soft = (self.exposure_soft as f64).clamp(e_lo, e_hi);
         if !self.quantize {
             let e = (product / g_min).clamp(e_lo, e_soft);
-            let g = (product / e.max(1.0)).clamp(g_min, self.gain_max as f64);
+            let g = (product / e.max(1.0)).clamp(g_min, ghi as f64);
             // Gain exhausted: the exposure may go above the soft cap (extended range).
             let e = if product / g > e { product / g } else { e };
-            return self.clamp_setting(e, g);
+            return clamp(e, g);
         }
+        let table = self.model.ladder();
         if product / g_min <= e_soft {
-            let e = ladder(product / g_min).clamp(e_lo, e_soft);
-            return self.clamp_setting(e, g_min);
+            let e = ladder_in(table, product / g_min).clamp(e_lo, e_soft);
+            return clamp(e, g_min);
         }
-        let mut codes: Vec<u16> = GAIN_CODES
+        let high = self.model.high();
+        let mut codes: Vec<u16> = self
+            .model
+            .gain_codes()
             .iter()
             .copied()
-            .filter(|&g| g >= self.gain_min && g <= self.gain_max)
+            .filter(|&g| g >= glo && g <= ghi)
             .collect();
         // The power-on gain (Windows' 449) is the one code above the ladder; only when the cap allows it.
-        if self.gain_max >= POWER_ON_GAIN && self.gain_min <= POWER_ON_GAIN {
+        if high.is_empty() && ghi >= POWER_ON_GAIN && glo <= POWER_ON_GAIN {
             codes.push(POWER_ON_GAIN);
         }
         let need = product / e_soft;
         if let Some(g) = codes.iter().copied().find(|&g| g as f64 >= need) {
-            let e = ladder_down(product / g as f64).clamp(e_lo, e_soft);
-            return self.clamp_setting(e, g as f64);
+            let e = ladder_down_in(table, product / g as f64).clamp(e_lo, e_soft);
+            return clamp(e, g as f64);
+        }
+        if !high.is_empty() {
+            // The top of the gain stage and every higher setting inside the caps: the nearest in log brightness.
+            let mut cand: Vec<(u16, u16)> = Vec::new();
+            if let Some(&g) = codes.last() {
+                cand.push(clamp(ladder_down_in(table, e_soft), g as f64));
+            }
+            cand.extend(high.iter().copied().filter(|&(e, g)| e >= elo && e <= ehi && g >= glo && g <= ghi));
+            let dist = |&(e, g): &(u16, u16)| ((e as f64 * g as f64).max(1.0) / product.max(1.0)).ln().abs();
+            if let Some(best) = cand.iter().copied().min_by(|a, b| dist(a).total_cmp(&dist(b))) {
+                return best;
+            }
         }
         // Every gain code is used up: the exposure grows past the soft cap (exposure last), up to `exposure_max`.
-        let g = codes.last().copied().unwrap_or(self.gain_min) as f64;
-        let e = ladder(product / g).clamp(e_lo, e_hi);
-        self.clamp_setting(e, g)
+        let g = codes.last().copied().unwrap_or(glo) as f64;
+        let e = ladder_in(table, product / g).clamp(e_lo, e_hi);
+        clamp(e, g)
+    }
+
+    /// The pair's setting inside its caps: unchanged when it already is, otherwise the split of its product.
+    pub fn fit_pair(&self, k: usize, e: u16, g: u16) -> (u16, u16) {
+        let (elo, ehi, glo, ghi) = self.pair_caps(k);
+        if self.model.pair_ranges().is_none() || ((elo..=ehi).contains(&e) && (glo..=ghi).contains(&g)) {
+            return (e, g);
+        }
+        self.split_pair(k, e.max(1) as f64 * g.max(1) as f64)
     }
 }
 
@@ -975,8 +1264,14 @@ impl AutoExposure {
         let mean = pairs.iter().map(|&k| stats[k].trimmed_mean).sum::<f64>() / pairs.len() as f64;
         let (ce, cg) = self.caps(self.light.stage);
         let (ne, ng) = self.caps(0);
+        let ranges = self.p.model.pair_ranges();
         let at_ceiling = pairs.iter().all(|&k| {
             let c = self.p.pairs[k][0];
+            // A model with Windows ranges per pair: the pair's own top (the Crystal's upper pair ends at 8941 / 439).
+            let (ce, cg) = match ranges {
+                Some(r) => (ce.min(r[k].1), cg.min(r[k].3)),
+                None => (ce, cg),
+            };
             setting.gain[c] >= cg && setting.exposure[c] as f64 >= 0.97 * ce as f64
         });
         // "settled": every controlled pair needs less than half of the normal ceiling product.
@@ -1034,11 +1329,16 @@ impl AutoExposure {
 
     /// New (exposure, gain) for a pair whose frame was taken with `(e, g)` and shows statistics `s`.
     pub fn step_pair(&self, e: u16, g: u16, s: &TileStats) -> (u16, u16, f64) {
-        self.step_pair_with(e, g, s, false)
+        self.step_pair_with(0, e, g, s, false)
+    }
+
+    /// [`AutoExposure::step_pair`] for pair `k` (0 lower, 1 upper; the caps of that pair).
+    pub fn step_pair_k(&self, k: usize, e: u16, g: u16, s: &TileStats) -> (u16, u16, f64) {
+        self.step_pair_with(k, e, g, s, false)
     }
 
     /// [`AutoExposure::step_pair`]; `no_brighter` (the too-bright rule is latched) turns a brighten request into none.
-    fn step_pair_with(&self, e: u16, g: u16, s: &TileStats, no_brighter: bool) -> (u16, u16, f64) {
+    fn step_pair_with(&self, k: usize, e: u16, g: u16, s: &TileStats, no_brighter: bool) -> (u16, u16, f64) {
         let mut err = self.error(s);
         if no_brighter && err > 0.0 {
             err = 0.0;
@@ -1057,7 +1357,7 @@ impl AutoExposure {
         .ln();
         let r = (self.p.k * err).clamp(-lim, lim).exp();
         let base = e.max(1) as f64 * g.max(1) as f64;
-        let (ne, ng) = self.p.split(base * r);
+        let (ne, ng) = self.p.split_pair(k, base * r);
         let new = ne as f64 * ng as f64;
         // The caps can make the split darker than the frame's own setting (e.g. the power-on 10410/449 in a dark
         // room): never step against the error.
@@ -1101,7 +1401,10 @@ impl AutoExposure {
             }
             let latched = self.sat_latch[k];
             let (e, g, mut err) =
-                self.step_pair_with(setting.exposure[a], setting.gain[a], &stats[k], latched);
+                self.step_pair_with(k, setting.exposure[a], setting.gain[a], &stats[k], latched);
+            // A model with Windows ranges per pair (Crystal Super): the result always lies inside them, even when the
+            // frame's own setting (the firmware default) or a no-step answer does not.
+            let (e, g) = self.p.fit_pair(k, e, g);
             // Rate limit: at most one change per pair per `min_change_ns` (about 5 changes/s). The frames in
             // between were taken with the old setting and must not be acted on twice.
             if err != 0.0 && prev.is_some() {
@@ -1114,6 +1417,16 @@ impl AutoExposure {
             errs[k] = err;
             if err != 0.0 || prev.is_none() {
                 // Outside the deadband (or first frame): the new value is relative to what this frame used.
+                next.exposure[a] = e;
+                next.exposure[b] = e;
+                next.gain[a] = g;
+                next.gain[b] = g;
+            }
+        }
+        if self.p.model.pair_ranges().is_some() {
+            // Also a pair that is not controlled (`upper` off) goes out inside Windows' ranges, as one equal pair.
+            for (k, &[a, b]) in self.p.pairs.iter().enumerate() {
+                let (e, g) = self.p.fit_pair(k, next.exposure[a], next.gain[a]);
                 next.exposure[a] = e;
                 next.exposure[b] = e;
                 next.gain[a] = g;
@@ -1890,5 +2203,218 @@ mod tests {
         assert!(!w.good(&ok, 2680, 13, t, false));
         t += step;
         assert!(w.good(&ok, 2680, 13, t, false));
+    }
+
+    // ---- Crystal Super (analysis/crystal-super-ae.md) ----
+
+    fn crystal() -> AeParams {
+        AeParams::for_model(AeModel::CrystalSuper)
+    }
+
+    #[test]
+    fn dream_air_defaults_are_unchanged() {
+        assert_eq!(AeParams::for_model(AeModel::DreamAir), AeParams::default());
+        assert_eq!(AeParams::old_law_for(AeModel::DreamAir), AeParams::old_law());
+        let p = AeParams::default();
+        assert_eq!((p.exposure_min, p.exposure_max, p.gain_min, p.gain_max, p.exposure_soft), (1140, 4108, 13, 215, 4108));
+        assert_eq!(p.model, AeModel::DreamAir);
+        assert_eq!(AeModel::DreamAir.pair_ranges(), None);
+        assert_eq!(AeModel::DreamAir.power_on(), (10410, 449));
+        // Golden split values (the same before the model constants existed).
+        for (x, want) in [
+            (1.0, (1140, 13)),
+            (2200.0 * 13.0, (2200, 13)),
+            (3150.0 * 13.0, (3143, 13)),
+            (4108.0 * 13.0, (4108, 13)),
+            (1e12, (4108, 215)),
+        ] {
+            assert_eq!(p.split(x), want, "{x}");
+            assert_eq!(p.split_pair(1, x), want, "{x} upper");
+        }
+        // Extended stage 2 (Dream Air only): the power-on gain and the long exposure.
+        let ae = AutoExposure::new(AeParams::default());
+        let (e, g) = ae.caps(2);
+        let q = AeParams { exposure_max: e, gain_max: g, ..AeParams::default() };
+        assert_eq!(q.split(1e12), (10410, 449));
+        assert_eq!(q.split(4108.0 * 300.0).1, 449);
+    }
+
+    #[test]
+    fn crystal_tables_are_windows_values() {
+        // Every pair Windows sent on the Crystal (16751 commands, both pairs) that is not on the low-gain ladder at
+        // a gain below 215 is in the high table, and the tables ascend.
+        assert!(CRYSTAL_EXPOSURE_LADDER.windows(2).all(|w| w[0] < w[1]));
+        assert!(CRYSTAL_GAIN_CODES.windows(2).all(|w| w[0] < w[1]));
+        assert!(CRYSTAL_HIGH.windows(2).all(|w| (w[0].0 as u32 * w[0].1 as u32) < (w[1].0 as u32 * w[1].1 as u32)));
+        assert!(CRYSTAL_EXPOSURE_LADDER.iter().all(|v| EXPOSURE_LADDER.contains(v)), "the Dream Air's ladder from 2200");
+        for e in [2200, 2875, 2962, 3758, 3988] {
+            assert!(CRYSTAL_EXPOSURE_LADDER.contains(&e), "{e} at gain 13");
+        }
+        assert_eq!(CRYSTAL_HIGH[0], (4194, 215));
+        assert_eq!(CRYSTAL_HIGH[CRYSTAL_HIGH.len() - 1], (10410, 449));
+        assert_eq!(*CRYSTAL_GAIN_CODES.last().unwrap(), 215);
+        // Steps above the soft cap stay small (at most 8.5 % in brightness, as Windows).
+        let mut prev = 4108.0 * 215.0;
+        for &(e, g) in &CRYSTAL_HIGH {
+            let x = e as f64 * g as f64;
+            assert!(x / prev < 1.085, "{e}/{g}");
+            prev = x;
+        }
+        assert_eq!(AeModel::CrystalSuper.power_on(), (3500, 60));
+    }
+
+    #[test]
+    fn crystal_split_follows_windows() {
+        let p = crystal();
+        assert_eq!((p.exposure_min, p.exposure_max, p.gain_min, p.gain_max), (2200, 10410, 13, 449));
+        // Low light levels: the ladder at gain 13, never below Windows' 2200.
+        assert_eq!(p.split(1.0), (2200, 13));
+        assert_eq!(p.split(2200.0 * 13.0), (2200, 13));
+        assert_eq!(p.split(2875.0 * 13.0), (2875, 13));
+        assert_eq!(p.split(4108.0 * 13.0), (4108, 13));
+        // Gain stage: a Crystal gain code with the exposure just below the soft cap.
+        let (e, g) = p.split(3900.0 * 49.0);
+        assert!(CRYSTAL_GAIN_CODES.contains(&g) && g <= 49 && e <= 4108, "{e}/{g}");
+        // Above: every high setting maps onto itself, and the top is 10410 / 449 (upper pair: 8941 / 439).
+        for &(e, g) in &CRYSTAL_HIGH {
+            let x = e as f64 * g as f64;
+            assert_eq!(p.split(x), (e, g));
+            if e <= 8941 && g <= 439 {
+                assert_eq!(p.split_pair(1, x), (e, g));
+            }
+        }
+        assert_eq!(p.split(1e12), (10410, 449));
+        assert_eq!(p.split_pair(1, 1e12), (8941, 439));
+        // Never the Dream Air's 449-at-4108 jump: a product just above the gain stage takes gain 215.
+        assert_eq!(p.split(4150.0 * 215.0).1, 215);
+        // Every split of a product sweep is a Windows setting inside the pair's range.
+        let mut x = 1000.0;
+        while x < 1e8 {
+            for k in 0..2 {
+                let (e, g) = p.split_pair(k, x);
+                let (elo, ehi, glo, ghi) = CRYSTAL_PAIR_RANGES[k];
+                assert!((elo..=ehi).contains(&e) && (glo..=ghi).contains(&g), "{x}: {e}/{g}");
+                let on_ladder = g < 215 && CRYSTAL_GAIN_CODES.contains(&g) && e <= 4108;
+                let gain13 = g == 13 && CRYSTAL_EXPOSURE_LADDER.contains(&e);
+                let top = g == 215 && e <= 4108 && CRYSTAL_EXPOSURE_LADDER.contains(&e);
+                assert!(on_ladder || gain13 || top || CRYSTAL_HIGH.contains(&(e, g)), "{x}: {e}/{g} not a Windows setting");
+            }
+            x *= 1.01;
+        }
+    }
+
+    #[test]
+    fn crystal_overrides_stay_in_the_windows_range() {
+        // The env is process wide: only this test sets these names (others build their params directly).
+        std::env::set_var("PIMAX_CAM_AE_EXP_MIN", "100");
+        std::env::set_var("PIMAX_CAM_AE_GAIN_MAX", "900");
+        let c = AeParams::from_env_model(AeModel::CrystalSuper);
+        let d = AeParams::from_env_model(AeModel::DreamAir);
+        std::env::remove_var("PIMAX_CAM_AE_EXP_MIN");
+        std::env::remove_var("PIMAX_CAM_AE_GAIN_MAX");
+        assert_eq!((c.exposure_min, c.gain_max), (2200, 449));
+        // The Dream Air's bounds are the old ones.
+        assert_eq!((d.exposure_min, d.gain_max), (100, 449));
+        let o = AeParams::old_law_for(AeModel::CrystalSuper);
+        assert_eq!((o.exposure_min, o.law, o.model), (2200, AeLaw::V1, AeModel::CrystalSuper));
+        // No extended range and no low stage on the Crystal: the normal range is already Windows' whole range.
+        let ae = AutoExposure::new(crystal());
+        assert_eq!(ae.top_stage(), 0);
+        assert!(!ae.p.light.clip_enabled);
+    }
+
+    /// Closed loop on the simulated sensor from the Crystal's firmware default, dark to bright rooms: every target is
+    /// inside Windows' per-pair ranges (what the allowlist accepts), the pairs stay equal, it settles.
+    #[test]
+    fn crystal_closed_loop_stays_in_range() {
+        for &(radiance, blob) in &[(90.0, true), (30.0, false), (300.0, false), (6.0, false), (0.5, false), (3000.0, true)] {
+            let mut ae = AutoExposure::new(crystal());
+            let (pe, pg) = CRYSTAL_POWER_ON;
+            let mut applied = AeSetting { exposure: [pe; 4], gain: [pg; 4], led_exposure: 40, led_gain: 62 };
+            let mut pipeline: Vec<(usize, AeSetting)> = Vec::new();
+            let mut t = 0u64;
+            let mut means = Vec::new();
+            for i in 0..250usize {
+                while pipeline.first().is_some_and(|(f, _)| *f <= i) {
+                    applied = pipeline.remove(0).1;
+                }
+                let lo = render(radiance, applied.exposure[0], applied.gain[0], blob);
+                let up = render(radiance * 0.6, applied.exposure[2], applied.gain[2], false);
+                let tiles = [view(&lo), view(&lo), view(&up), view(&up)];
+                let st = ae.frame_stats(&tiles, &Mask::default());
+                means.push(st[0].trimmed_mean);
+                let d = ae.update(&applied, st, t);
+                let tg = ae.target().unwrap();
+                assert!(AeModel::CrystalSuper.allows(&tg), "radiance {radiance}: {tg:?}");
+                assert!(tg.exposure[0] == tg.exposure[1] && tg.exposure[2] == tg.exposure[3]);
+                assert!(tg.gain[0] == tg.gain[1] && tg.gain[2] == tg.gain[3]);
+                assert_eq!(&payload(&tg)[..2], &AE_HEAD);
+                if d.send {
+                    pipeline.push((i + 2, tg));
+                }
+                t += 40_000_000;
+            }
+            let m = *means.last().unwrap();
+            let (e, g) = (applied.exposure[0], applied.gain[0]);
+            let pinned_low = e == 2200 && g == 13;
+            let pinned_high = e == 10410 && g == 449;
+            assert!(
+                (m / 64.0).ln().abs() < 0.3 || (pinned_low && m > 64.0) || (pinned_high && m < 64.0),
+                "radiance {radiance}: mean {m} at {e}/{g}"
+            );
+        }
+    }
+
+    #[test]
+    fn crystal_fit_and_allows() {
+        let p = crystal();
+        // The Dream Air's power-on 10410/449 on the upper pair is outside the Crystal's upper range: refitted.
+        assert_eq!(p.fit_pair(1, 10410, 449), (8941, 439));
+        assert_eq!(p.fit_pair(0, 10410, 449), (10410, 449));
+        assert_eq!(p.fit_pair(0, 3500, 60), (3500, 60), "the firmware default is inside the ranges");
+        assert_eq!(p.fit_pair(0, 1000, 13), (2200, 13));
+        let ok = AeSetting { exposure: [10410, 10410, 8941, 8941], gain: [449, 449, 439, 439], led_exposure: 40, led_gain: 62 };
+        assert!(AeModel::CrystalSuper.allows(&ok));
+        assert!(!AeModel::CrystalSuper.allows(&AeSetting { exposure: [10410; 4], ..ok }));
+        assert!(!AeModel::CrystalSuper.allows(&AeSetting { gain: [449, 449, 440, 440], ..ok }));
+        assert!(!AeModel::CrystalSuper.allows(&AeSetting { exposure: [2199, 2199, 3000, 3000], ..ok }));
+        assert!(!AeModel::CrystalSuper.allows(&AeSetting { led_exposure: 41, ..ok }));
+        assert!(AeModel::DreamAir.allows(&AeSetting { exposure: [1; 4], ..ok }), "the Dream Air enforces nothing here");
+        // The first Windows command on the Crystal (take cold2): 2200/13 on all four cameras.
+        let first = parse_payload(&[
+            0x58, 0x19, 0x51, 0x00, 0x01, 0x32, 0x98, 0x08, 0x98, 0x08, 0x98, 0x08, 0x98, 0x08, 0x0d, 0x00, 0x0d, 0x00,
+            0x0d, 0x00, 0x0d, 0x00, 0x28, 0x00, 0x3e, 0x00,
+        ])
+        .unwrap();
+        assert_eq!(first.exposure, [2200; 4]);
+        assert!(AeModel::CrystalSuper.allows(&first));
+    }
+
+    #[test]
+    fn model_detection() {
+        assert_eq!(model_from_pids(&[0x0040, 0x0041, 0x0014]).0, AeModel::CrystalSuper);
+        assert_eq!(model_from_pids(&[0x0044, 0x0043, 0x0014]).0, AeModel::DreamAir);
+        assert_eq!(model_from_pids(&[]).0, AeModel::DreamAir);
+        assert_eq!(model_from_pids(&[0x0040, 0x0044]).0, AeModel::DreamAir);
+        for m in [AeModel::DreamAir, AeModel::CrystalSuper] {
+            assert_eq!(AeModel::parse(m.id()), Some(m));
+        }
+        assert_eq!(AeModel::parse("Crystal_Super"), Some(AeModel::CrystalSuper));
+        assert_eq!(AeModel::parse("8kx"), None);
+        assert_eq!(AeModel::by_pid(0x0040), Some(AeModel::CrystalSuper));
+        assert_eq!(AeModel::by_pid(0x0044), Some(AeModel::DreamAir));
+        // A sysfs-like tree.
+        let dir = std::env::temp_dir().join(format!("pimax-ae-sysfs-{}", std::process::id()));
+        for (n, v, p) in [("1-1", "34a4", "0040"), ("1-2", "34a4", "0014"), ("1-3", "046d", "0040")] {
+            let d = dir.join(n);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("idVendor"), format!("{v}\n")).unwrap();
+            std::fs::write(d.join("idProduct"), format!("{p}\n")).unwrap();
+        }
+        let mut pids = usb_pids_sysfs(&dir);
+        pids.sort();
+        assert_eq!(pids, [0x0014, 0x0040]);
+        assert_eq!(model_from_pids(&pids).0, AeModel::CrystalSuper);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
