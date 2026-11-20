@@ -16,3 +16,5 @@ omarchyvr-doctor = { path = "../omarchyvr-doctor" }
 
 [dev-dependencies]
 pimax-proto = { workspace = true, features = ["std"] }
+# the auto-exposure tables and controller, checked against each headset's camera_ae allowlist (tests/allowlist.rs)
+pimax-cam = { path = "../pimax-cam" }

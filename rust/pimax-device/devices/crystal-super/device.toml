@@ -1,8 +1,8 @@
 # Pimax Crystal Super (Micro-OLED module, P3C10): EXPERIMENTAL. It speaks the Dream Air protocol (58 .. frames on IF0,
 # the same IMU and controller reports); every command below was seen in the Windows capture of 2026-10-17 with
 # Pimax Play 2.0.2.103 (analysis/crystal-super-capture-20261017.md, take names in `source`). Nothing here has run
-# against the headset from Linux yet. Captured but not allowed yet: the IPD motor, camera exposure (other ranges than
-# the Dream Air), the eye-module power off.
+# against the headset from Linux yet. Captured but not allowed yet: the IPD motor, the eye-module power off. Camera
+# exposure (`camera_ae`) is allowed with the Crystal's own Windows ranges (user, 2026-10-19), sent only with PIMAX_CAM_AE=1.
 
 [device]
 id = "crystal-super"
@@ -44,8 +44,11 @@ status = "unknown"
 motor = false                         # the motor exists (take ipd: 58 06 5c 05 01 <mm*100 LE>), not enabled yet
 
 [cameras]
-status = "unknown"
-count = 0
+status = "experimental"               # same UVC stream and metadata as the Dream Air (analysis/crystal-super-capture-20261017.md)
+count = 4                             # OV7251 tiles on one UVC node, 60 fps before the first exposure push
+tile = [640, 480]
+frame = [2560, 832]
+auto_exposure = "start_ae"            # [[hid]] camera_ae below; pimax-cam ae.rs AeModel::CrystalSuper
 
 [audio]
 status = "unknown"                    # USB audio on the HID device (interfaces 4-7), not DisplayPort as on the Dream Air
@@ -134,6 +137,14 @@ id = "read_calib_block"
 bytes = "58 07 0a 00 01 {addr:u16le} 10"
 params = ["addr=0..0xffff"]
 source = "take cold2, 96 blocks"
+
+[[hid]]
+id = "camera_ae"
+bytes = "58 19 51 00 01 32 {e0:u16le} {e1:u16le} {e2:u16le} {e3:u16le} {g0:u16le} {g1:u16le} {g2:u16le} {g3:u16le} {led_e:u16le} {led_g:u16le}"
+params = ["e0=2200..10410", "e1=2200..10410", "e2=2200..8941", "e3=2200..8941", "g0=13..449", "g1=13..449", "g2=13..439", "g3=13..439", "led_e=40", "led_g=62"]
+policy = "session"
+approved = "user, 2026-10-19 (Windows ranges of the Crystal Super capture 2026-10-17; sent only with PIMAX_CAM_AE=1)"
+source = "all 14 takes, 16751 commands every 80 ms (first: take cold2 t=27.880, 2200/13); per-pair min/max and the LED pair 40/62 as sent; analysis/crystal-super-ae.md; pimax-cam/src/ae.rs CRYSTAL_*"
 
 [[hid]]
 id = "eye_power_on"

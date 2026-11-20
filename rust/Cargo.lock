@@ -2527,6 +2527,7 @@ name = "pimax-device"
 version = "0.1.0"
 dependencies = [
  "omarchyvr-doctor",
+ "pimax-cam",
  "pimax-proto",
 ]
 

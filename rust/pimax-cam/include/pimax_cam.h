@@ -336,7 +336,7 @@ pimax_cam_track_get_info(const pimax_cam_track *t, pimax_cam_track_info *out);
  *   58 19 51 00 | 01 32 | e0 e1 e2 e3 | g0 g1 g2 g3 | led_e led_g   (u16 LE; LED pair constant 40/62)
  * This library never sends anything: the driver decides (PIMAX_CAM_AE=1 sends, "dry" only logs, default off).
  * Tuning: PIMAX_CAM_AE_TARGET, _EXP_MIN, _EXP_MAX, _GAIN_MIN, _GAIN_MAX, _PERIOD_MS, _K, _DEADBAND, _UPPER, _EXTEND (0 = no automatic
- * extended range in low light). */
+ * extended range in low light), _MODEL (dream-air | crystal-super: the headset's ladder, gain codes and limits). */
 
 #define PIMAX_CAM_AE_CMD 0x51
 #define PIMAX_CAM_AE_OPT 0x00
@@ -361,9 +361,15 @@ typedef struct pimax_cam_ae_out
 	                   bit 2 = "tracking light low" warning (the library already logs and toasts it) */
 } pimax_cam_ae_out;
 
-/* Defaults + PIMAX_CAM_AE_* overrides. NULL on error. */
+/* Defaults of the headset on USB (34a4:0040 = Crystal Super, else Dream Air; PIMAX_CAM_AE_MODEL=dream-air|crystal-super
+ * overrides) + PIMAX_CAM_AE_* overrides. Logs "PIMAX_AE_MODEL: <id> (...)". NULL on error. */
 pimax_cam_ae *
 pimax_cam_ae_create(void);
+/* The same for a named model ("dream-air", "crystal-super"; NULL or "" = detect as above). The Crystal Super uses the
+ * Windows ranges of its capture (lower pair 2200..10410 us / gain 13..449, upper pair 2200..8941 / 13..439) and never
+ * hands out a payload outside them. NULL on an unknown name. */
+pimax_cam_ae *
+pimax_cam_ae_create_model(const char *model);
 void
 pimax_cam_ae_destroy(pimax_cam_ae *ae);
 /* After pimax_cam_next returned a frame: 1 = send out->payload now, 0 = nothing (LED frame, replay, no metadata,
